@@ -1,7 +1,7 @@
-import { is, each, Pick } from 'shared'
+import { is, each, Pick, Timeout } from 'shared'
 import * as G from 'shared/globals'
 
-import { matchProp, DEFAULT_PROPS, callProp } from './helpers'
+import { matchProp, DEFAULT_PROPS, callProp, concatFn } from './helpers'
 import {
   AnimationResolver,
   AnimationResult,
@@ -17,6 +17,7 @@ import {
 export interface RunAsyncProps<T = any> extends SpringProps<T> {
   callId: number
   cancel: boolean
+  pause: boolean
   reset: boolean
   delay: number
   to?: any
@@ -27,6 +28,8 @@ export interface RunAsyncState<T> {
   asyncTo?: SpringChain<T> | SpringToFn<T>
   /** Resolves when the current `asyncTo` finishes or gets cancelled. */
   promise?: AsyncResult<T>
+  /** Call this to pause the `delay` prop */
+  pause?: () => void
   /** Call this to unpause the current `asyncTo` function or array. */
   unpause?: () => void
   /** The last time we saw a matching `cancel` prop. */
@@ -108,8 +111,11 @@ export async function runAsync<T>(
         }
 
         if (getPaused()) {
-          state.unpause = await new Promise(resolve => {
-            state.unpause = resolve
+          await new Promise(resolve => {
+            state.unpause = concatFn(state.unpause, () => {
+              state.unpause = void 0
+              resolve()
+            })
           })
         }
 
@@ -159,8 +165,8 @@ export async function runAsync<T>(
 
 interface ScheduledProps<T> {
   key?: string
-  props: Pick<SpringProps<T>, 'cancel' | 'reset' | 'delay'>
-  state: { cancelId?: number }
+  props: Pick<SpringProps<T>, 'cancel' | 'pause' | 'reset' | 'delay'>
+  state: RunAsyncState<T>
   action: (props: RunAsyncProps<T>, resolve: AnimationResolver<T>) => void
 }
 
@@ -173,11 +179,36 @@ export function scheduleProps<T>(
   { key, props, state, action }: ScheduledProps<T>
 ): AsyncResult<T> {
   return new Promise((resolve, reject) => {
-    const delay = Math.max(0, callProp(props.delay || 0, key))
-    if (delay > 0) G.frameLoop.setTimeout(run, delay)
-    else run()
+    const pause = matchProp(props.pause, key)
 
-    function run() {
+    let delay = Math.max(0, callProp(props.delay || 0, key))
+    if (delay > 0) {
+      let timeout: Timeout
+      const onPause = () => {
+        state.pause = void 0
+        state.unpause = concatFn(state.unpause, onResume)
+        timeout.cancel()
+        delay = Math.max(0, timeout.time - G.now())
+      }
+      const onResume = () => {
+        state.unpause = void 0
+        state.pause = concatFn(state.pause, onPause)
+        timeout = G.frameLoop.setTimeout(next, delay)
+      }
+      if (pause) {
+        state.unpause = concatFn(state.unpause, onResume)
+      } else {
+        timeout = G.frameLoop.setTimeout(next, delay)
+        state.pause = concatFn(state.pause, onPause)
+      }
+    } else {
+      next()
+    }
+
+    function next() {
+      if (delay > 0) {
+        state.pause = void 0
+      }
       let { cancel, reset } = props
       try {
         // Might have been cancelled during its delay.
@@ -190,7 +221,7 @@ export function scheduleProps<T>(
           }
         }
         reset = !cancel && matchProp(reset, key)
-        action({ ...props, callId, delay, cancel, reset }, resolve)
+        action({ ...props, callId, delay, cancel, pause, reset }, resolve)
       } catch (err) {
         reject(err)
       }
